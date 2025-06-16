@@ -1,8 +1,9 @@
+from itertools import cycle
 from pathlib import Path
 from typing import Any, Iterable
 import pandas as pd
-from dataclasses import dataclass
-from llmlib.base_llm import LLM as BaseLLM, Conversation
+from dataclasses import dataclass, field
+from llmlib.base_llm import LLM as BaseLLM, Conversation, LlmReq
 from llmlib.huggingface_inference import is_img, is_video
 import logging
 from .openai.openai_completion import (
@@ -22,12 +23,13 @@ class ModelvLLM(BaseLLM):
     temperature: float = 0
     remote_call_concurrency: int = 8
     port: int = 8000
+    more_ports: list[int] = field(default_factory=list)
     timeout_secs: int = 120
 
     def complete_msgs(
-        self, msgs: Conversation, output_dict: bool = False, **generate_kwargs
+        self, msgs: Conversation, output_dict: bool = False, **gen_kwargs
     ) -> str | dict:
-        for result in self.complete_batch([msgs], **generate_kwargs):
+        for result in self.complete_batch([msgs], **gen_kwargs):
             pass  # Avoid RuntimeError: async generator ignored GeneratorExit
         if output_dict:
             return result
@@ -38,29 +40,43 @@ class ModelvLLM(BaseLLM):
         self,
         batch: Iterable[Conversation],
         metadatas: Iterable[dict] | None = None,
-        **generate_kwargs,
+        **gen_kwargs,
     ) -> Iterable[dict]:
-        listof_convos = (to_vllm_oai_format(convo) for convo in batch)
+        if metadatas is None:
+            metadatas = cycle([{}])
 
-        params = dict(
+        new_batch = [
+            LlmReq(convo=convo, gen_kwargs=gen_kwargs, metadata=md)
+            for convo, md in zip(batch, metadatas)
+        ]
+        return self.complete_batchof_reqs(new_batch)
+
+    def complete_batchof_reqs(self, batch: Iterable[LlmReq]) -> Iterable[dict]:
+        fixed_gen_kwargs = dict(
             model=self.model_id,
             temperature=self.temperature,
             max_tokens=self.max_new_tokens,
         )
-        params = params | generate_kwargs
-
-        server = f"http://localhost:{self.port}/v1"
+        new_batch = [
+            req.replace(
+                gen_kwargs=fixed_gen_kwargs | req.gen_kwargs,
+                messages=to_vllm_oai_format(req.convo),
+            )
+            for req in batch
+        ]
+        base_urls = [f"http://localhost:{port}/v1" for port in self.all_ports()]
         agen = _batch_call_openai(
-            base_url=server,
+            base_urls=base_urls,
             headers={"Content-Type": "application/json"},
-            iterof_messages=listof_convos,
-            gen_kwargs=params,
+            batch=new_batch,
             remote_call_concurrency=self.remote_call_concurrency,
             timeout_secs=self.timeout_secs,
-            metadatas=metadatas,
         )
         gen = to_synchronous_generator(agen)
         return gen
+
+    def all_ports(self) -> list[int]:
+        return [self.port] + self.more_ports
 
 
 def to_vllm_oai_format(convo: Conversation) -> list[dict]:

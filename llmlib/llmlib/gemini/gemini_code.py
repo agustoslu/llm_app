@@ -3,12 +3,13 @@ Based on https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/video-
 """
 
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 import json
 from logging import getLogger
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Iterable, TypeVar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import storage
 from google.cloud.storage import transfer_manager
 from google.genai.types import (
@@ -20,6 +21,7 @@ from google.genai.types import (
     HttpOptions,
     CreateCachedContentConfig,
     CachedContent,
+    ThinkingConfig,
 )
 import cv2
 import os
@@ -28,7 +30,7 @@ import requests
 from tqdm import tqdm
 import google
 from strenum import StrEnum
-from ..base_llm import LLM, Message, validate_only_first_message_has_files
+from ..base_llm import LLM, Message, validate_only_first_message_has_files, LlmReq
 from ..error_handling import notify_bugsnag
 from pydantic import BaseModel
 
@@ -58,7 +60,7 @@ class GeminiModels(StrEnum):
     https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview#supported_models
     """
 
-    gemini_25_pro = "gemini-2.5-pro-preview-03-25"
+    gemini_25_pro = "gemini-2.5-pro-preview-06-05"
     default = gemini_25_flash = "gemini-2.5-flash-preview-04-17"
     gemini_20_flash = "gemini-2.0-flash-001"
     gemini_20_flash_lite = "gemini-2.0-flash-lite-001"
@@ -75,14 +77,16 @@ available_models = list(GeminiModels)
 class MultiTurnRequest:
     messages: list[Message]
     model_name: GeminiModels = GeminiModels.default
-    max_output_tokens: int = 1000
+    gen_kwargs: dict[str, Any] = field(default_factory=dict)
     safety_filter_threshold: HarmBlockThreshold = HarmBlockThreshold.BLOCK_NONE
     delete_files_after_use: bool = True
     use_context_caching: bool = False
     location: str = default_location
     json_schema: type[BaseModel] | None = None
+    output_dict: bool = False
+    include_thoughts: bool = False
 
-    def fetch_media_description(self) -> str:
+    def fetch_media_description(self) -> str | dict:
         return _execute_multi_turn_req(self)
 
 
@@ -109,14 +113,22 @@ def _execute_multi_turn_req(req: MultiTurnRequest) -> str:
         cached_content = None
 
     # Call Gemini
-    response: GenerateContentResponse = _call_gemini(
-        client, req, contents, cached_content
-    )
+    response, config = _call_gemini(client, req, contents, cached_content)
 
     # Cleanup
     if req.delete_files_after_use:
         delete_blobs(blobs)
-    return response.text
+
+    if not req.output_dict:
+        return response.text
+
+    data = {"response": response.text, **config}
+    reasonings = [p.text for p in response.candidates[0].content.parts if p.thought]
+    if len(reasonings) > 1:
+        logger.warning("Found %d reasoning parts. Expected 1.", len(reasonings))
+    if len(reasonings) > 0:
+        data["reasoning"] = reasonings[0]
+    return data
 
 
 def is_long_enough_to_cache(paths: list[Path]) -> bool:
@@ -187,16 +199,20 @@ def _call_gemini(
     req: MultiTurnRequest,
     contents: list[Part],
     cached_content: CachedContent | None = None,
-) -> GenerateContentResponse:
+) -> tuple[GenerateContentResponse, dict]:
     logger.info("Calling the Google API. model_name='%s'", req.model_name)
-    config = {
+    default_gen_kwargs = {
+        "max_output_tokens": 1000,
         "temperature": 0.0,
-        "max_output_tokens": req.max_output_tokens,
         "safety_settings": safety_filters(req.safety_filter_threshold),
     }
+    config = default_gen_kwargs | req.gen_kwargs
     if req.json_schema is not None:
         config["response_mime_type"] = "application/json"
         config["response_schema"] = req.json_schema
+
+    if req.include_thoughts:
+        config["thinking_config"] = ThinkingConfig(include_thoughts=True)
 
     if isinstance(cached_content, CachedContent):
         config["cached_content"] = cached_content.name
@@ -204,20 +220,24 @@ def _call_gemini(
     response: GenerateContentResponse = client.models.generate_content(
         model=req.model_name, contents=contents, config=config
     )
-    logger.info("Token usage: %s", response.usage_metadata.to_json_dict())
+    token_usage = response.usage_metadata.to_json_dict()
+    logger.info("Token usage: %s", token_usage)
 
     if len(response.candidates) == 0:
         raise ResponseRefusedException(
             "No candidates in response. prompt_feedback='%s'" % response.prompt_feedback
         )
-    else:
-        logger.info("Finish reason: %s", response.candidates[0].finish_reason)
 
-    enum = type(response.candidates[0].finish_reason)
-    if response.candidates[0].finish_reason in {enum.SAFETY, enum.PROHIBITED_CONTENT}:
+    finish_reason = response.candidates[0].finish_reason
+    logger.info("Finish reason: %s", finish_reason)
+
+    enum = type(finish_reason)
+    if finish_reason in {enum.SAFETY, enum.PROHIBITED_CONTENT}:
         raise UnsafeResponseError(safety_ratings=response.candidates[0].safety_ratings)
+    if finish_reason == enum.MAX_TOKENS:
+        raise ValueError("Max tokens reached. Token usage: %s" % repr(token_usage))
 
-    return response
+    return response, config
 
 
 def create_client(location: str = default_location):
@@ -346,19 +366,29 @@ class ResponseRefusedException(Exception):
 @dataclass
 class GeminiAPI(LLM):
     model_id: str = GeminiModels.default
-    max_output_tokens: int = 1000
     use_context_caching: bool = False
     delete_files_after_use: bool = True
     safety_filter_threshold: HarmBlockThreshold = HarmBlockThreshold.BLOCK_NONE
     location: str = default_location  # https://cloud.google.com/about/locations#europe
+    max_n_batching_threads: int = 16
+    include_thoughts: bool = False
 
     requires_gpu_exclusively = False
     model_ids = available_models
 
     def complete_msgs(
-        self, msgs: list[Message], output_dict: bool = False, **kwargs
+        self,
+        msgs: list[Message],
+        output_dict: bool = False,
+        json_schema: type[BaseModel] | None = None,
+        **gen_kwargs,
     ) -> str:
-        req = self._multiturn_req(msgs=msgs, **kwargs)
+        req = self._multiturn_req(
+            msgs=msgs,
+            output_dict=output_dict,
+            gen_kwargs=gen_kwargs,
+            json_schema=json_schema,
+        )
         return req.fetch_media_description()
 
     def video_prompt(self, video: Path | BytesIO, prompt: str) -> str:
@@ -372,11 +402,11 @@ class GeminiAPI(LLM):
         req = MultiTurnRequest(
             messages=msgs,
             model_name=self.model_id,
-            max_output_tokens=self.max_output_tokens,
             safety_filter_threshold=self.safety_filter_threshold,
             delete_files_after_use=delete_files_after_use,
             use_context_caching=self.use_context_caching,
             location=self.location,
+            include_thoughts=self.include_thoughts,
             **kwargs,
         )
         return req
@@ -396,6 +426,35 @@ class GeminiAPI(LLM):
             location=self.location,
         )
         return name
+
+    def complete_batchof_reqs(self, batch: list[LlmReq]) -> Iterable[dict]:
+        if len(batch) == 0:
+            return []
+        n_threads = min(len(batch), self.max_n_batching_threads)
+        with ThreadPoolExecutor(max_workers=n_threads) as executor:
+            futures = [
+                executor.submit(self._complete_single_llmreq, args)
+                for args in enumerate(batch)
+            ]
+            for future in as_completed(futures):
+                yield future.result()
+
+    def _complete_single_llmreq(self, args: tuple[int, LlmReq]) -> dict:
+        request_idx, req = args
+        try:
+            mt_kwargs = {"gen_kwargs": req.gen_kwargs, "output_dict": True}
+            mt_req = self._multiturn_req(msgs=req.convo, **mt_kwargs)
+            data = mt_req.fetch_media_description()
+            data = data | {"success": True, "request_idx": request_idx, **req.metadata}
+            return data
+        except Exception as e:
+            logger.error("Error processing request %d: %s", request_idx, e)
+            return {
+                "success": False,
+                "request_idx": request_idx,
+                "error": str(e),
+                **req.metadata,
+            }
 
 
 def filepaths(msg: Message) -> list[Path]:

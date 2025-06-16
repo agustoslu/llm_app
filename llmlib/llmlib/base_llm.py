@@ -5,7 +5,7 @@ from typing_extensions import Self
 from PIL import Image
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -32,18 +32,34 @@ class Message:
 Conversation = list[Message]
 
 
+@dataclass
+class LlmReq:
+    """Entry for batch request"""
+
+    convo: Conversation
+    messages: list[dict] = field(default_factory=list)
+    gen_kwargs: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
+
+    def replace(self, **kwargs) -> Self:
+        return replace(self, **kwargs)
+
+
 class LLM:
     model_id: str
     requires_gpu_exclusively: bool = False
 
     def complete_msgs(
-        self, msgs: Conversation, output_dict: bool = False, **generate_kwargs
+        self, msgs: Conversation, output_dict: bool = False, **gen_kwargs
     ) -> str | dict:
         raise NotImplementedError
 
     def complete_batch(
-        self, batch: Iterable[Conversation], **generate_kwargs
+        self, batch: Iterable[Conversation], **gen_kwargs
     ) -> Iterable[dict]:
+        raise NotImplementedError
+
+    def complete_batchof_reqs(self, batch: Iterable[LlmReq]) -> Iterable[dict]:
         raise NotImplementedError
 
     def video_prompt(self, video: Path | BytesIO, prompt: str) -> str:

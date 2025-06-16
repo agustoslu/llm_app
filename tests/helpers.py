@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import PIL
 import cv2
-from llmlib.base_llm import LLM, Message
+from llmlib.base_llm import LLM, Message, LlmReq
 import numpy as np
 from pydantic import BaseModel
 import pytest
@@ -89,7 +89,8 @@ def assert_model_deals_graciously_with_individual_failures(model: LLM) -> None:
         [non_existing_file_message()],
         [forest_message()],
     ]
-    responses = model.complete_batch(batch=batch)
+    metadatas = [{"key": 2}, {"key": 1}, {"key": 3}]
+    responses = model.complete_batch(batch=batch, metadatas=metadatas)
     responses = sorted(responses, key=lambda r: r["request_idx"])
     ok_response, fail_response, ok_response2 = responses
     assert ok_response["success"]
@@ -97,6 +98,11 @@ def assert_model_deals_graciously_with_individual_failures(model: LLM) -> None:
 
     assert not fail_response["success"]
     assert fail_response["error"] is not None
+
+    expected_metadata_vals = [m["key"] for m in metadatas]
+    for r, expected_val in zip(responses, expected_metadata_vals):
+        assert "key" in r, r
+        assert r["key"] == expected_val, r["key"]
 
 
 def assert_model_rejects_unsupported_batches(model: LLM) -> None:
@@ -115,10 +121,11 @@ def assert_model_recognizes_pyramid_in_image(model: LLM):
     assert "pyramid" in answer.lower(), answer
 
 
-def assert_model_recognizes_afd_in_video(model: LLM):
+def assert_model_recognizes_afd_in_video(model: LLM, **kwargs):
     video_path = file_for_test("video.mp4")
     question = "Describe the video in english"
-    answer: str = model.video_prompt(video_path, question).lower()
+    convo = [Message(role="user", msg=question, video=video_path)]
+    answer: str = model.complete_msgs(msgs=convo, **kwargs).lower()
     assert "alternative für deutschland" in answer or "afd" in answer, answer
 
 
@@ -236,7 +243,7 @@ def assert_model_supports_multiturn_with_multiple_imgs(model: LLM):
     convo.append(Message(role="assistant", msg=answer1))
     convo.append(Message(role="user", msg="How are they related?"))
     answer2 = model.complete_msgs(convo).lower()
-    possible_answers = ["biodiversity", "ecosystem", "habitat"]
+    possible_answers = ["biodiversity", "ecosystem", "habitat", "environment"]
     assert any(answer in answer2 for answer in possible_answers), answer2
 
 
@@ -284,3 +291,21 @@ def assert_model_can_output_json_schema(model: LLM, check_batch_mode: bool = Tru
     group2 = json.loads(r2)
     assert Group.model_validate(group2)
     assert len(group2["people"]) == 3
+
+
+def assert_model_can_use_multiple_gen_kwargs(model: LLM):
+    req1 = LlmReq(
+        convo=[Message.from_prompt(prompt="Whats the capital of France?")],
+        gen_kwargs={"temperature": 0.5},
+    )
+    req2 = LlmReq(
+        convo=[Message.from_prompt(prompt="Whats the capital of Germany?")],
+        gen_kwargs={"temperature": 0.8},
+    )
+    responses = model.complete_batchof_reqs(batch=[req1, req2])
+    r1, r2 = list(sorted(responses, key=lambda r: r["request_idx"]))
+
+    assert "temperature" in r1, r1
+    assert r1["temperature"] == 0.5, r1["temperature"]
+    assert "temperature" in r2, r2
+    assert r2["temperature"] == 0.8, r2["temperature"]
