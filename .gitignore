@@ -3,7 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 models/
-
+profiles/
+test-files/unittest-batch-gemini/submit_confirmation.json
 # C extensions
 *.so
 

@@ -60,8 +60,8 @@ class GeminiModels(StrEnum):
     https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview#supported_models
     """
 
-    gemini_25_pro = "gemini-2.5-pro-preview-06-05"
-    default = gemini_25_flash = "gemini-2.5-flash-preview-04-17"
+    gemini_25_pro = "gemini-2.5-pro"
+    default = gemini_25_flash = "gemini-2.5-flash"
     gemini_20_flash = "gemini-2.0-flash-001"
     gemini_20_flash_lite = "gemini-2.0-flash-lite-001"
 
@@ -187,11 +187,14 @@ def get_cached_content(
     return None, False
 
 
-def convert_to_gemini_format(msg: Message) -> tuple[Content, list[storage.Blob]]:
-    role_map = dict(user="user", assistant="model")
-    role = role_map[msg.role]
+def convert_to_gemini_format(msg: Message) -> Content:
+    role: str = role_map(msg.role)
     parts = [Part.from_text(text=msg.msg)]
     return Content(role=role, parts=parts)
+
+
+def role_map(role: str) -> str:
+    return dict(user="user", assistant="model")[role]
 
 
 def _call_gemini(
@@ -417,7 +420,7 @@ class GeminiAPI(LLM):
             "While Gemini supports multi-turn, and multi-file chat, we have only implemented single-file and single-turn prompts atm."
         ]
 
-    def submit_batch_job(self, entries: list["BatchEntry"], tgt_dir: Path) -> str:
+    def submit_batch_job(self, entries: list[LlmReq], tgt_dir: Path | str) -> str:
         name: str = submit_batch_job(
             model_id=self.model_id,
             entries=entries,
@@ -483,13 +486,14 @@ def PathNeededError():
 
 def submit_batch_job(
     model_id: str,
-    entries: list["BatchEntry"],
-    tgt_dir: Path,
+    entries: list[LlmReq],
+    tgt_dir: Path | str,
     safety_filter_threshold: HarmBlockThreshold,
     location: str,
 ) -> str:
     # Create and dump input jsonl file
     input_rows: list[dict] = [to_batch_row(c, safety_filter_threshold) for c in entries]
+    tgt_dir = Path(tgt_dir)
     tgt_dir.mkdir(parents=True, exist_ok=True)
     input_jsonl = tgt_dir / "input.jsonl"
     pd.DataFrame(input_rows).to_json(input_jsonl, orient="records", lines=True)
@@ -502,7 +506,7 @@ def submit_batch_job(
     )
 
     # Upload media files
-    all_files = [file for e in entries for file in e.files]
+    all_files = [file for e in entries for m in e.convo for file in m.files]
     for files in tqdm(chunk(all_files, 2500)):
         upload_files(files)
 
@@ -510,7 +514,7 @@ def submit_batch_job(
     output_dir = f"{batch_name}/output"
     input_uri: str = storage_uri(Buckets.output, blob_name=input_blob_name)
     output_uri: str = storage_uri(Buckets.output, blob_name=output_dir)
-    excluded_fields = list(set(k for e in entries for k in e.row_data.keys()))
+    excluded_fields = list(set(k for e in entries for k in e.metadata.keys()))
     response = submit_batch(
         model_id=model_id,
         batch_name=batch_name,
@@ -519,28 +523,36 @@ def submit_batch_job(
         excluded_fields=excluded_fields,
         location=location,
     )
-    response.raise_for_status()
-    logger.info("Successfully submitted batch prediction job. JSON=%s", response.json())
-    return response.json()["name"]
+    if response.status_code != 200:
+        raise Exception(
+            "Failed to submit batch job. status_code={}, response={}".format(
+                response.status_code, response.text
+            )
+        )
+    confirmation_data = response.json()
+    logger.info(
+        "Successfully submitted batch prediction job. JSON=%s", confirmation_data
+    )
+    confirmation_file = tgt_dir / "submit_confirmation.json"
+    confirmation_file.write_text(json.dumps(confirmation_data, indent=2))
+    return confirmation_data["name"]
 
 
-@dataclass
-class BatchEntry:
-    prompt: str
-    files: list[Path]
-    """The row_data is not seen by the LLM, just used to identify the row"""
-    row_data: dict[str, str]
-
-
-def to_batch_row(be: BatchEntry, threshold: HarmBlockThreshold) -> dict:
-    file_parts = [part_dict(f) for f in be.files]
+def to_batch_row(be: LlmReq, threshold: HarmBlockThreshold) -> dict:
+    contents = [
+        {
+            "role": role_map(msg.role),
+            "parts": [part_dict(f) for f in msg.files] + [{"text": msg.msg}],
+        }
+        for msg in be.convo
+    ]
+    config = be.gen_kwargs | {"thinking_config": {"include_thoughts": True}}
     return {
-        **be.row_data,
+        **be.metadata,
         "request": {
-            "contents": [{"role": "user", "parts": [*file_parts, {"text": be.prompt}]}],
-            # TODO: This line below might need serialization
+            "contents": contents,
             "safetySettings": safety_filters(threshold=threshold),
-            "generation_config": {"temperature": 0.0},
+            "generation_config": config,
         },
     }
 
