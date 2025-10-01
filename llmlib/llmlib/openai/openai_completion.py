@@ -5,6 +5,7 @@ import os
 from typing import Generator, Iterable, AsyncGenerator
 import aiohttp
 import asyncio
+from tenacity import RetryCallState, retry, stop_after_attempt, retry_if_exception_type
 from ..base_llm import LLM, LlmReq, Conversation, Message
 from ..rest_api.restapi_client import encode_as_png_in_base64
 
@@ -23,8 +24,10 @@ class OpenAIModel(LLM):
     model_id: str = _default_model
     base_url: str = "https://api.openai.com/v1"
     api_key: str = field(default_factory=get_openai_api_key)
-    generation_kwargs: dict = field(default_factory=dict)
     remote_call_concurrency: int = 32
+    timeout_secs: int = 60
+    temperature: float = 0.0
+    max_new_tokens: int = 500
 
     def headers(self) -> dict:
         return {
@@ -52,8 +55,11 @@ class OpenAIModel(LLM):
         if metadatas is None:
             metadatas = cycle([{}])
 
-        gen_kwargs = {"model": self.model_id, "temperature": 0.0} | gen_kwargs
-        gen_kwargs = gen_kwargs | self.generation_kwargs
+        gen_kwargs = {
+            "model": self.model_id,
+            "temperature": self.temperature,
+            "max_tokens": self.max_new_tokens,
+        } | gen_kwargs
 
         new_batch = [
             LlmReq(
@@ -70,6 +76,31 @@ class OpenAIModel(LLM):
             headers=self.headers(),
             batch=new_batch,
             remote_call_concurrency=self.remote_call_concurrency,
+            timeout_secs=self.timeout_secs,
+        )
+        gen = to_synchronous_generator(agen)
+        return gen
+
+    def complete_batchof_reqs(self, batch: Iterable[LlmReq]) -> Iterable[dict]:
+        fixed_gen_kwargs = dict(
+            model=self.model_id,
+            temperature=self.temperature,
+            max_tokens=self.max_new_tokens,
+        )
+        new_batch = [
+            req.replace(
+                gen_kwargs=fixed_gen_kwargs | req.gen_kwargs,
+                messages=extract_msgs(req.convo),
+            )
+            for req in batch
+        ]
+        base_urls = [self.base_url]
+        agen = _batch_call_openai(
+            base_urls=base_urls,
+            headers=self.headers(),
+            batch=new_batch,
+            remote_call_concurrency=self.remote_call_concurrency,
+            timeout_secs=self.timeout_secs,
         )
         gen = to_synchronous_generator(agen)
         return gen
@@ -78,7 +109,7 @@ class OpenAIModel(LLM):
 def to_synchronous_generator(
     agen: AsyncGenerator[dict, None],
 ) -> Generator[dict, None, None]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
     try:
         while True:
             output: dict = loop.run_until_complete(agen.__anext__())
@@ -121,14 +152,13 @@ def extract_msg(msg: Message) -> dict:
     }
 
 
-def config_for_cerebras_on_openrouter() -> dict:
-    """kwargs for OpenAIModel to use Cerebras on OpenRouter"""
+def config_for_openrouter():
     logger.info("Reading OpenRouter API key from environment variable")
-    return {
+    config = {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": os.environ["OPENROUTER_API_KEY"],
-        "generation_kwargs": {"provider": {"only": ["Cerebras"]}},
     }
+    return config
 
 
 async def _batch_call_openai(
@@ -160,7 +190,7 @@ async def _batch_call_openai(
                     },
                 }
             metadata = req.metadata | {"request_idx": request_idx} | req.gen_kwargs
-            coro = _call_openai(
+            coro = _call_openai_safely(
                 session=session,
                 post_kwargs=post_kwargs,
                 metadata=metadata,
@@ -171,29 +201,58 @@ async def _batch_call_openai(
             yield await task
 
 
+def _log_retry_attempt(retry_state: RetryCallState):
+    logger.warning(
+        "Retrying OpenAI API call (attempt %d/3) due to timeout",
+        retry_state.attempt_number + 1,
+    )
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    retry=retry_if_exception_type(aiohttp.SocketTimeoutError),
+    before_sleep=_log_retry_attempt,
+)
 async def _call_openai(
-    session: aiohttp.ClientSession,
-    post_kwargs: dict,
-    metadata: dict,
+    session: aiohttp.ClientSession, post_kwargs: dict, metadata: dict
+) -> dict:
+    async with session.post(**post_kwargs) as response:
+        if response.status != 200:
+            data = await log_and_make_error(response)
+            return data | metadata
+        completion = await response.json()
+    asdict = as_dict(completion) | metadata
+    set_success(asdict)
+    return asdict
+
+
+async def _call_openai_safely(
+    session: aiohttp.ClientSession, post_kwargs: dict, metadata: dict
 ) -> dict:
     request_idx = metadata["request_idx"]
     logger.debug("Calling OpenAI API for request %d", request_idx)
     try:
-        async with session.post(**post_kwargs) as response:
-            if response.status != 200:
-                data = await log_and_make_error(response)
-                return data | metadata
-            completion = await response.json()
-        asdict = as_dict(completion) | metadata
-        asdict["success"] = True
-        return asdict
-
+        return await _call_openai(session, post_kwargs, metadata)
     except Exception as e:
         logger.error(
             "Error calling OpenAI API for request %d. Cause: %s", request_idx, repr(e)
         )
         asdict = {"error": repr(e), "success": False}
         return asdict | metadata
+
+
+def set_success(asdict: dict) -> None:
+    asdict["success"] = True
+    check_tok_lims = "max_tokens" in asdict and "n_output_tokens" in asdict
+    if not check_tok_lims:
+        return
+    within_tok_lims = asdict["n_output_tokens"] < asdict["max_tokens"]
+    if within_tok_lims:
+        return
+    # Reached token limit
+    assert "error" not in asdict, asdict  # We should not overwrite an error
+    asdict["error"] = "n_output_tokens equals max_tokens"
+    asdict["success"] = False
 
 
 async def log_and_make_error(response: aiohttp.ClientResponse) -> dict:

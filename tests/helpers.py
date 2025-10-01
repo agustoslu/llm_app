@@ -1,4 +1,6 @@
 import base64
+from dataclasses import dataclass
+import difflib
 import json
 import os
 from pathlib import Path
@@ -309,7 +311,7 @@ def assert_model_can_output_json_schema(model: LLM, check_batch_mode: bool = Tru
     assert len(group2["people"]) == 3
 
 
-def assert_model_can_use_multiple_gen_kwargs(model: LLM):
+def assert_model_can_use_multiple_gen_kwargs_in_batch(model: LLM):
     req1 = LlmReq(
         convo=[Message.from_prompt(prompt="Whats the capital of France?")],
         gen_kwargs={"temperature": 0.5},
@@ -321,7 +323,45 @@ def assert_model_can_use_multiple_gen_kwargs(model: LLM):
     responses = model.complete_batchof_reqs(batch=[req1, req2])
     r1, r2 = list(sorted(responses, key=lambda r: r["request_idx"]))
 
+    assert r1["success"], r1
+    assert r2["success"], r2
     assert "temperature" in r1, r1
     assert r1["temperature"] == 0.5, r1["temperature"]
     assert "temperature" in r2, r2
     assert r2["temperature"] == 0.8, r2["temperature"]
+
+
+def assert_model_returns_failure_when_hitting_token_limit(model: LLM):
+    req = LlmReq(
+        convo=[Message.from_prompt(prompt="Whats the capital of France?")],
+        gen_kwargs={"max_tokens": 2},
+    )
+    response = list(model.complete_batchof_reqs(batch=[req]))[0]
+    assert not response["success"]
+    assert "n_output_tokens equals max_tokens" in response["error"]
+
+
+def assert_string_almost_equal(s1: str, s2: str):
+    similarity = difflib.SequenceMatcher(None, s1, s2).ratio()
+    if similarity < 0.9:
+        raise ValueError(f"Strings are not almost equal: '{s1}' and '{s2}'")
+
+
+@dataclass(frozen=True)
+class TranscriptionCase:
+    file: Path
+    expected_transcription: str
+    english_translation_en: str | None = None
+
+
+class TranscriptionCases:
+    librispeech_2 = TranscriptionCase(
+        file=file_for_test("some-audio.flac"),
+        expected_transcription='Before he had time to answer a much encumbered Vera burst into the room with the question, "I say, can I leave these here?" These were a small black pig and a lusty specimen of black-red gamecock.',
+    )
+    afd_video = TranscriptionCase(
+        file=file_for_test("video.mp4"),
+        expected_transcription="Der Ruf von Franz Josef Strauß, damals nicht das rot-grüne Narrenschiff zu betreten, ist nicht nur ignoriert worden. Es kam schlimmer. Die Unionsparteien oder deren Politiker sind heute wichtige Offiziere auf dem rot-grünen Narrenschiff Utopia. Es bedarf daher dringend eines Korrektivs in diesem Land und das können und werden nur wir sein. Ohne uns geht Deutschland unter in einer Flut der illegalen Migration, in einer Flut mit ungedecktem Zentralbankgeld und einem nicht endenden Dauerkrisenmodus.",
+        # Translation below by Gemini on 2025-09-11
+        english_translation_en="Franz Josef Strauss's call at the time not to board the red-green Ship of Fools wasn't just ignored—it got worse. Today, the Union parties and their politicians are important officers on the red-green Ship of Fools, Utopia. Therefore, this country urgently needs a corrective force, and only we can and will be that. Without us, Germany will sink in a flood of illegal migration, a flood of uncovered central bank money, and a never-ending state of crisis.",
+    )

@@ -19,10 +19,11 @@ from .helpers import (
     assert_model_can_answer_batch_of_img_prompts,
     assert_model_deals_graciously_with_individual_failures,
     assert_model_can_output_json_schema,
-    assert_model_can_use_multiple_gen_kwargs,
+    assert_model_can_use_multiple_gen_kwargs_in_batch,
     assert_model_can_answer_batch_of_text_prompts,
     # assert_model_supports_multiturn_with_6min_video,
     assert_model_supports_multiturn,
+    assert_model_returns_failure_when_hitting_token_limit,
 )
 
 
@@ -112,7 +113,7 @@ def test_vllm_model_deals_graciously_with_individual_failures(vllm_model):
 
 @pytest.mark.skipif(condition=is_ci(), reason="Avoid costs")
 def test_vllm_model_can_use_multiple_gen_kwargs(vllm_model):
-    assert_model_can_use_multiple_gen_kwargs(vllm_model)
+    assert_model_can_use_multiple_gen_kwargs_in_batch(vllm_model)
 
 
 def test_vllm_model_format_case1():
@@ -203,6 +204,10 @@ def test_vllm_model_local_multi_turn_with_images(vllm_model):
 # Qwen 3B cannot correctly answer this
 # def test_vllm_model_local_multi_turn_with_6min_video(vllm_model):
 #     assert_model_supports_multiturn_with_6min_video(vllm_model)
+
+
+def test_vllm_model_returns_failure_when_hitting_token_limit(vllm_model):
+    assert_model_returns_failure_when_hitting_token_limit(vllm_model)
 
 
 def test_vllm_server_get_models(vllm_server: VLLMServer):
